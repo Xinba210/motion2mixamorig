@@ -30,6 +30,7 @@ from pathlib import Path
 
 import numpy as np
 
+from .extract import video_native_fps
 from .mixamo.animation import RetargetedAnimation, all_points, skin_frames
 from .mixamo.kinematics import normalize
 from .mixamo.render import (
@@ -536,13 +537,16 @@ def render_run_videos(
         "mixamo_character": writer("mixamo_character.mp4", width, height),
         "compare": writer("compare.mp4", 2 * width, 2 * height),
     }
+    # Motion frames are at the model rate (GVHMR resamples to 30 fps) while the source
+    # may be 60 fps or more: pick the original frame at the same timestamp, not index.
+    source_fps = video_native_fps(source_video) or fps
     originals = _OriginalReader(source_video, width, height)
     try:
         for i in range(anim.n):
             t = anim.frames[i] / fps
             p_orig, p_mix, p_hum, p_char = _draw_panels(
                 anim, asset, calibration, i,
-                original=originals.frame(anim.frames[i]),
+                original=originals.frame(int(round(t * source_fps))),
                 original_label=original_label,
                 stamp=f"  f{anim.frames[i]}  t={t:.2f}s",
                 cam=cam, ground=ground,

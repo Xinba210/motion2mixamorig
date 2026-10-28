@@ -68,9 +68,9 @@ CONTROLLED_BONES = (
 def rest_world_rotations(rig: MixamoRig) -> dict[str, np.ndarray]:
     """World rotation of each bone's rest frame.
 
-    FK is `M_local = T * Rpre * R_anim`, so at rest (`R_anim = I`) the bone's
-    world rotation is `R_parent_world @ Rpre`. PreRotation therefore stays part
-    of the rest transform and is never folded into the animation channel.
+    FK is `M_local = T_bind * R_bind * R_anim`, so at rest (`R_anim = I`) the
+    bone's world rotation is `R_parent_world @ R_bind`. The full bind rotation
+    stays in the node transform and is never folded into the animation channel.
     """
     world = forward_kinematics(rig, {})
     return {name: np.asarray(mat[:3, :3], dtype=np.float64) for name, mat in world.items()}
@@ -119,7 +119,7 @@ class YBotMapping:
         """Transfer one frame of rest-relative local rotations onto the Y Bot rig.
 
         Input and output are both animation-channel rotations, i.e. the `R_anim`
-        of `M_local = T * Rpre * R_anim`. Bones the Mixamo retarget does not
+        of `M_local = T_bind * R_bind * R_anim`. Bones the Mixamo retarget does not
         author (the finger chains) are left at rest.
         """
         out: dict[str, np.ndarray] = {}

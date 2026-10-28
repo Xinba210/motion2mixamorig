@@ -29,12 +29,24 @@ def _on_language_update(self, context: Context) -> None:
 _UI_LANGUAGE_ITEMS = (
     ("AUTO", "Auto (Blender / System)", ""),
     ("en", "English", ""),
-    ("zh_CN", "中文", ""),
+    ("zh_CN", "简体中文", ""),
+    ("zh_TW", "繁體中文", ""),
     ("ko", "한국어", ""),
     ("ja", "日本語", ""),
     ("de", "Deutsch", ""),
     ("ru", "Русский", ""),
     ("ar", "العربية", ""),
+    ("vi", "Tiếng Việt", ""),
+    ("fil", "Filipino", ""),
+    ("th", "ไทย", ""),
+    ("fr", "Français", ""),
+    ("es", "Español", ""),
+    ("tr", "Türkçe", ""),
+    ("ne", "नेपाली", ""),
+    ("id", "Bahasa Indonesia", ""),
+    ("pl", "Polski", ""),
+    ("nl", "Nederlands", ""),
+    ("it", "Italiano", ""),
 )
 
 

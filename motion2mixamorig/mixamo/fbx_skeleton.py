@@ -1,8 +1,11 @@
 """Parse a binary Mixamo FBX and extract the core skeleton.
 
-Reads the binary FBX directly (PreRotation is a Maya/FBX property, so Assimp
-cannot be used) and returns the core-bone skeleton as a plain dict — the same
-structure `kinematics.rig_from_skeleton_data` consumes.
+FBX files do not all encode a joint's bind orientation the same way. Mixamo's
+source files commonly use ``PreRotation``; Cinema 4D exports often bake that
+orientation into ``Lcl Rotation`` and may leave those Euler channels unsuitable
+for reconstructing the original bind pose on their own. The bind matrices in
+FBX Pose nodes and skin Cluster ``TransformLink`` records are authoritative,
+so prefer them when present and fall back to local TRS for unskinned joints.
 """
 
 from __future__ import annotations
@@ -212,6 +215,23 @@ def _child_named(node: dict[str, Any], name: str) -> dict[str, Any] | None:
     return None
 
 
+def _mat4_fbx(values: Any) -> np.ndarray:
+    """FBX stores 4x4 matrices in row-major property arrays; use column vectors."""
+    return np.asarray(values, dtype=np.float64).reshape(4, 4).T
+
+
+def rotation_part(matrix: np.ndarray) -> np.ndarray:
+    """Return the nearest proper rotation matrix, removing FBX scale/shear."""
+    matrix = np.asarray(matrix, dtype=np.float64).reshape(3, 3)
+    u, _, vt = np.linalg.svd(matrix)
+    rotation = u @ vt
+    if np.linalg.det(rotation) < 0.0:
+        u = u.copy()
+        u[:, -1] *= -1.0
+        rotation = u @ vt
+    return rotation
+
+
 def _vec3(value: Any, default: tuple[float, float, float] = (0.0, 0.0, 0.0)) -> np.ndarray:
     if value is None:
         return np.array(default, dtype=np.float64)
@@ -418,9 +438,43 @@ def extract_bind_pose(objects: dict[int, dict[str, Any]]) -> dict[int, np.ndarra
                 continue
             uid = int(node_elem["props"][0])
             values = matrix_elem["props"][0]
-            mat = np.asarray(values, dtype=np.float64).reshape(4, 4).T
-            poses[uid] = mat
+            poses[uid] = _mat4_fbx(values)
     return poses
+
+
+def extract_cluster_bind_transforms(
+    objects: dict[int, dict[str, Any]],
+    connections: list[tuple[str, int, int]],
+    limbs: dict[int, dict[str, Any]],
+) -> dict[int, np.ndarray]:
+    """Get each linked bone's bind-world matrix from skin Cluster TransformLink.
+
+    Cinema 4D exports may omit FBX Pose nodes, while retaining the bind matrices
+    that skinning uses. When multiple meshes link to the same bone, choose the
+    medoid TransformLink matrix (the closest one to all the others) to tolerate
+    tiny exporter rounding differences without averaging rotation matrices.
+    """
+    clusters = {
+        uid: obj
+        for uid, obj in objects.items()
+        if obj["node_name"] == "Deformer" and obj.get("class") == "Cluster"
+    }
+    by_bone: dict[int, list[np.ndarray]] = {}
+    for kind, src, dst in connections:
+        if kind != "OO" or src not in limbs or dst not in clusters:
+            continue
+        elem = _child_named(clusters[dst]["raw"], "TransformLink")
+        if elem is None or not elem["props"]:
+            continue
+        matrix = _mat4_fbx(elem["props"][0])
+        by_bone.setdefault(src, []).append(matrix)
+
+    out: dict[int, np.ndarray] = {}
+    for uid, matrices in by_bone.items():
+        distances = [sum(float(np.linalg.norm(candidate - other)) for other in matrices)
+                     for candidate in matrices]
+        out[uid] = matrices[int(np.argmin(distances))].copy()
+    return out
 
 
 def collect_limb_nodes(objects: dict[int, dict[str, Any]]) -> dict[int, dict[str, Any]]:
@@ -498,6 +552,42 @@ def compose_world(
     return world
 
 
+def compose_rest_transforms(
+    parent_of: dict[int, int | None],
+    local_from_properties: dict[int, np.ndarray],
+    bind_world: dict[int, np.ndarray],
+) -> tuple[dict[int, np.ndarray], dict[int, np.ndarray]]:
+    """Compose rest locals/worlds, preferring authoritative bind-world matrices.
+
+    ``Pose`` matrices win over ``Cluster.TransformLink`` matrices before this
+    function is called. For a joint with a bind-world matrix, derive its local
+    rest matrix relative to its effective parent. This recovers the bind frame
+    even when an exporter rewrites or bakes the source PreRotation channels.
+    Unlinked/end-site joints fall back to their FBX local TRS values.
+    """
+    local_of: dict[int, np.ndarray] = {}
+    world_of: dict[int, np.ndarray] = {}
+
+    def evaluate(uid: int) -> np.ndarray:
+        if uid in world_of:
+            return world_of[uid]
+        parent = parent_of.get(uid)
+        parent_world = evaluate(parent) if parent is not None else None
+        if uid in bind_world:
+            world = np.asarray(bind_world[uid], dtype=np.float64).reshape(4, 4).copy()
+            local = world.copy() if parent_world is None else np.linalg.solve(parent_world, world)
+        else:
+            local = np.asarray(local_from_properties[uid], dtype=np.float64).reshape(4, 4).copy()
+            world = local.copy() if parent_world is None else parent_world @ local
+        local_of[uid] = local
+        world_of[uid] = world
+        return world
+
+    for uid in local_from_properties:
+        evaluate(uid)
+    return local_of, world_of
+
+
 def unit_to_meters(settings: dict[str, Any]) -> float:
     """FBX default unit is centimeters when UnitScaleFactor == 1."""
     scale = float(settings.get("UnitScaleFactor", 1.0) or 1.0)
@@ -519,13 +609,21 @@ def extract_skeleton(fbx_path: Path) -> dict[str, Any]:
     limbs = collect_limb_nodes(objects)
     parent_of = build_hierarchy(limbs, connections)
 
-    local_of: dict[int, np.ndarray] = {}
+    local_from_properties: dict[int, np.ndarray] = {}
     parts_of: dict[int, dict[str, np.ndarray]] = {}
     for uid, obj in limbs.items():
         local, parts = bone_local_matrix(obj["props"])
-        local_of[uid] = local
+        local_from_properties[uid] = local
         parts_of[uid] = parts
-    world_of = compose_world(parent_of, local_of)
+    cluster_bind = extract_cluster_bind_transforms(objects, connections, limbs)
+    bind_world = dict(cluster_bind)
+    bind_world.update(bind_pose)  # FBX Pose is the highest-priority bind source.
+    bind_source = {
+        uid: "Pose" if uid in bind_pose else
+             "Cluster.TransformLink" if uid in cluster_bind else "local TRS"
+        for uid in limbs
+    }
+    local_of, world_of = compose_rest_transforms(parent_of, local_from_properties, bind_world)
 
     core_uids = [uid for uid, obj in limbs.items() if is_core_bone(obj["name"])]
     children_of: dict[int, list[int]] = {uid: [] for uid in core_uids}
@@ -559,11 +657,11 @@ def extract_skeleton(fbx_path: Path) -> dict[str, Any]:
         parent_uid = parent_of[uid]
         parent_name = limbs[parent_uid]["name"] if parent_uid in limbs else None
         child_names = [limbs[c]["name"] for c in sort_children(children_of[uid])]
-        bind = bind_pose.get(uid)
-        bind_err = None
-        if bind is not None:
-            bind_err = float(np.linalg.norm(world - bind))
+        bind = bind_world.get(uid)
+        bind_err = float(np.linalg.norm(world - bind)) if bind is not None else None
         pre = parts["pre_rotation_euler_deg"]
+        local_rotation = rotation_part(local[:3, :3])
+        world_rotation = rotation_part(world[:3, :3])
         bones.append(
             {
                 "name": obj["name"],
@@ -571,25 +669,31 @@ def extract_skeleton(fbx_path: Path) -> dict[str, Any]:
                 "children": child_names,
                 "pre_rotation_euler_deg": _tolist(pre),
                 "pre_rotation_matrix": _tolist(euler_xyz_deg_to_matrix(pre)),
-                "lcl_translation": _tolist(parts["lcl_translation"]),
+                # Effective local translation can differ from the raw Lcl value
+                # when an exporter has changed its bind transforms.
+                "lcl_translation": _tolist(local[:3, 3]),
+                "fbx_lcl_translation": _tolist(parts["lcl_translation"]),
                 "lcl_rotation_euler_deg": _tolist(parts["lcl_rotation_euler_deg"]),
                 "lcl_scaling": _tolist(parts["lcl_scaling"]),
                 "post_rotation_euler_deg": _tolist(parts["post_rotation_euler_deg"]),
+                "rest_rotation_matrix": _tolist(local_rotation),
                 "rest_local": {
                     "matrix": _tolist(local),
                     "translation": _tolist(local[:3, 3]),
-                    "rotation_matrix": _tolist(local[:3, :3]),
-                    "quaternion_wxyz": _tolist(matrix_to_quat_wxyz(local[:3, :3])),
+                    "rotation_matrix": _tolist(local_rotation),
+                    "quaternion_wxyz": _tolist(matrix_to_quat_wxyz(local_rotation)),
                     "scale": _tolist(np.array([np.linalg.norm(local[:3, i]) for i in range(3)])),
                 },
                 "rest_world": {
                     "matrix": _tolist(world),
                     "translation": _tolist(world[:3, 3]),
                     "translation_m": _tolist(world[:3, 3] * meters_per_fbx),
-                    "rotation_matrix": _tolist(world[:3, :3]),
-                    "quaternion_wxyz": _tolist(matrix_to_quat_wxyz(world[:3, :3])),
+                    "rotation_matrix": _tolist(world_rotation),
+                    "quaternion_wxyz": _tolist(matrix_to_quat_wxyz(world_rotation)),
                 },
-                "bind_pose_world_matrix": _tolist(bind) if bind is not None else None,
+                "bind_pose_world_matrix": _tolist(bind_pose[uid]) if uid in bind_pose else None,
+                "bind_world_matrix": _tolist(bind) if bind is not None else None,
+                "bind_transform_source": bind_source[uid],
                 "bind_pose_match_error": bind_err,
             }
         )
@@ -618,8 +722,10 @@ def extract_skeleton(fbx_path: Path) -> dict[str, Any]:
             "meters_per_fbx_unit": meters_per_fbx,
         },
         "transform_convention": (
-            "Maya/FBX: M_local = T * Roff * Rp * Rpre * R * Rpost^{-1} * Rp^{-1} * S; "
-            "M_world = M_parent_world * M_local. Euler XYZ in degrees, column-vector matrices."
+            "Rest bind matrices prefer FBX Pose, then skin Cluster.TransformLink, then local TRS. "
+            "Animation is a rest-relative delta: M_local = T_bind * R_bind * R_anim. "
+            "Property fallback uses Maya/FBX T * Roff * Rp * Rpre * R * Rpost^{-1} * Rp^{-1} * S; "
+            "column-vector matrices."
         ),
         "root": limbs[roots[0]]["name"] if roots else None,
         "bone_count": len(bones),

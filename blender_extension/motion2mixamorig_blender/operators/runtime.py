@@ -18,6 +18,7 @@ from ..services.result_reader import read_run_json
 
 _TIMER_INTERVAL = 0.25
 _KILL_AFTER_S = 4.0
+_DOWNLOAD_SAMPLE_S = 1.0
 
 
 @dataclass
@@ -138,6 +139,8 @@ def _poll() -> float | None:
 
     if runtime.kind == "doctor":
         _poll_doctor(runtime, props)
+    elif runtime.kind == "setup":
+        _poll_setup(runtime, props)
     else:
         _poll_run(runtime, props)
 
@@ -178,6 +181,50 @@ def _poll_doctor(runtime: JobRuntime, props) -> None:
         props.env_message = "env_cancelled"
 
 
+def _poll_setup(runtime: JobRuntime, props) -> None:
+    import time
+
+    latest = latest_progress(read_progress_file(runtime.progress_path))
+    if latest is not None:
+        props.setup_progress = latest.progress
+        props.setup_message = latest.message
+    code = runtime.process.poll()
+    if runtime.cancelled and code is None:
+        props.setup_status = "cancelling"
+        if time.monotonic() - runtime.cancel_started > _KILL_AFTER_S:
+            kill_process(runtime.process)
+        return
+    if code is None:
+        props.setup_status = "running"
+        return
+
+    _close_log(runtime)
+    runtime.finished = True
+    if runtime.cancelled:
+        props.setup_status = "cancelled"
+        return
+    if code != 0 or latest is None or latest.stage != "done":
+        props.setup_status = "failed"
+        return
+
+    # Point the add-on at the new runtime so "Check Environment" / "Generate" just work.
+    from ..preferences import get_preferences
+    from ..services.runtime_setup import app_dir, installed_python
+
+    home = Path(runtime.extra["home"])
+    python = installed_python(home)
+    if python is None:
+        props.setup_status = "failed"
+        return
+    prefs = get_preferences(bpy.context)
+    prefs.python_path = str(python)
+    prefs.project_dir = str(app_dir(home))
+    props.setup_status = "done"
+    props.setup_progress = 1.0
+    props.env_status = "NOT_CHECKED"
+    props.env_message = ""
+
+
 def _poll_run(runtime: JobRuntime, props) -> None:
     import time
 
@@ -191,6 +238,7 @@ def _poll_run(runtime: JobRuntime, props) -> None:
 
     props.job_output_dir = str(runtime.output_dir)
     props.job_log_path = str(runtime.log_path)
+    _poll_downloads(runtime, props)
 
     code = runtime.process.poll()
     if runtime.cancelled and code is None:
@@ -208,7 +256,30 @@ def _poll_run(runtime: JobRuntime, props) -> None:
     _finish_run(runtime, props, code)
 
 
+def _poll_downloads(runtime: JobRuntime, props) -> None:
+    """First run only: report model download progress, sampled about once a second."""
+    import time
+
+    tracker = runtime.extra.get("downloads")
+    if tracker is None:
+        props.dl_active = False
+        return
+    now = time.monotonic()
+    if now - runtime.extra.get("downloads_sampled", 0.0) < _DOWNLOAD_SAMPLE_S:
+        return
+    runtime.extra["downloads_sampled"] = now
+    snap = tracker.sample(now)
+    props.dl_done = float(snap.done)
+    props.dl_total = float(snap.total)
+    props.dl_rate = snap.rate
+    props.dl_eta = snap.eta_s
+    if snap.done >= snap.total:
+        runtime.extra.pop("downloads")
+        props.dl_active = False
+
+
 def _finish_run(runtime: JobRuntime, props, code: int) -> None:
+    props.dl_active = False
     if runtime.cancelled:
         props.job_status = "cancelled"
         props.job_stage = "cancelled"

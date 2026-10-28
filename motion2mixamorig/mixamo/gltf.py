@@ -1,8 +1,9 @@
 """Write a skinned Mixamo character + its animation as a .glb (glTF 2.0).
 
-Blender opens this in one import: mesh, skin weights, and the clip. Node TRS
-is the full local Mixamo transform `T * Rpre * R_anim` (glTF has no
-PreRotation), so the importer's linear-blend skin matches this repo's.
+Blender opens this in one import: mesh, skin weights, and the clip. Each joint
+node stores the recovered full bind-local transform ``T_bind * R_bind``; the
+animation channel stores the rest-relative delta ``R_anim``. This works whether
+the source FBX kept ``PreRotation`` or baked it into another bind representation.
 
 Units are metres (Y-up). Vertex influences are the top four weights.
 """
@@ -134,19 +135,17 @@ def write_glb(
             node["children"] = kids
         nodes.append(node)
 
-    mesh_node = len(nodes)
-    nodes.append({"name": "skinned_mesh", "mesh": 0, "skin": 0})
-
-    ibm = np.stack(
-        [_scale_affine(asset.meshes[0].ibm[i], scale) for i in range(n_bones)],
-        axis=0,
-    ).astype(np.float32)
-    # glTF stores matrices column-major.
-    ibm_acc = accessor(np.ascontiguousarray(ibm.transpose(0, 2, 1)), "MAT4", 5126)
-
-    primitives = []
+    # FBX skin clusters can have different inverse-bind matrices for each
+    # geometry object because each mesh has its own bind-space transform. A
+    # glTF skin has only one inverseBindMatrices accessor, shared by every
+    # node using that skin. Keep the meshes as separate nodes/skins so that
+    # each geometry preserves the per-mesh cluster matrices used by the
+    # preview renderer. The joint hierarchy itself is still shared.
+    mesh_nodes: list[int] = []
+    meshes: list[dict] = []
+    skins: list[dict] = []
     materials = []
-    for mesh in asset.meshes:
+    for mesh_i, mesh in enumerate(asset.meshes):
         verts = (mesh.vertices * scale).astype(np.float32)
         faces = np.ascontiguousarray(mesh.faces, dtype=np.uint32)
         joints, weights = _top4_weights(mesh.weights)
@@ -160,7 +159,7 @@ def write_glb(
                 "roughnessFactor": 0.7,
             },
         })
-        primitives.append({
+        primitive = {
             "attributes": {
                 "POSITION": accessor(verts, "VEC3", 5126, target=34962),
                 "NORMAL": accessor(normals, "VEC3", 5126, target=34962),
@@ -169,6 +168,32 @@ def write_glb(
             },
             "indices": accessor(faces.reshape(-1), "SCALAR", 5125, target=34963),
             "material": len(materials) - 1,
+        }
+        meshes.append({"name": mesh.name or f"character_mesh_{mesh_i}", "primitives": [primitive]})
+
+        ibm = np.stack(
+            [_scale_affine(mesh.ibm[i], scale) for i in range(n_bones)],
+            axis=0,
+        ).astype(np.float32)
+        # glTF stores matrices column-major. This is intentionally per mesh:
+        # using asset.meshes[0].ibm for every primitive breaks meshes whose
+        # FBX cluster Transform differs from the first geometry's Transform.
+        ibm_acc = accessor(np.ascontiguousarray(ibm.transpose(0, 2, 1)), "MAT4", 5126)
+        skin_i = len(skins)
+        skins.append({
+            # Same name on every skin: Blender names the armature after it, and
+            # earlier releases produced an armature called "mixamo".
+            "name": "mixamo",
+            "joints": list(range(n_bones)),
+            "skeleton": bone_index[rig.root],
+            "inverseBindMatrices": ibm_acc,
+        })
+        mesh_node = len(nodes)
+        mesh_nodes.append(mesh_node)
+        nodes.append({
+            "name": f"skinned_mesh_{mesh_i}_{mesh.name or 'mesh'}",
+            "mesh": mesh_i,
+            "skin": skin_i,
         })
 
     n = len(r_anim_frames)
@@ -206,16 +231,11 @@ def write_glb(
     gltf = {
         "asset": {"version": "2.0", "generator": "motion2mixamorig"},
         "scene": 0,
-        "scenes": [{"nodes": [bone_index[rig.root], mesh_node]}],
+        "scenes": [{"nodes": [bone_index[rig.root], *mesh_nodes]}],
         "nodes": nodes,
-        "meshes": [{"name": "character", "primitives": primitives}],
+        "meshes": meshes,
         "materials": materials,
-        "skins": [{
-            "name": "mixamo",
-            "joints": list(range(n_bones)),
-            "skeleton": bone_index[rig.root],
-            "inverseBindMatrices": ibm_acc,
-        }],
+        "skins": skins,
         "animations": [{"name": "mixamo_clip", "samplers": samplers, "channels": channels}],
         "accessors": accessors,
         "bufferViews": views,

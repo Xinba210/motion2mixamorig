@@ -2,7 +2,7 @@
 
 Modules:
     fbx_skeleton       binary FBX parser, core-bone skeleton extraction
-    kinematics         FK with FBX PreRotation, rotation utilities
+    kinematics         FK from FBX bind transforms, rotation utilities
     retarget           per-frame Human -> Mixamo Skeleton swing/aim retarget
     tpose_calibration  measured T-pose alignment skeleton <-> character rig
     ybot_retarget      rest-relative rotation transfer onto the full rig

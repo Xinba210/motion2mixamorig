@@ -1,12 +1,14 @@
-"""Mixamo Y Bot FK that keeps FBX PreRotation as a separate node.
+"""Mixamo FK using the source rig's full local bind orientation.
 
-Maya/FBX (and Assimp's extra PreRotation node) compose as:
+Some FBX files store bind orientation in ``PreRotation``; others (notably
+Cinema 4D exports) bake it into ``Lcl Rotation`` or preserve it only in skin
+bind matrices. Animation rotations in this package are deltas from that bind
+orientation, so the common convention is:
 
-    M_local = T * Rpre * R_anim
+    M_local = T_bind * R_bind * R_anim
     M_world = M_parent_world * M_local
 
-R_anim is the animated Lcl Rotation. Rpre is rest-only and is never baked
-into R_anim. Bone lengths live in T (Lcl Translation) and stay constant.
+The name ``pre_rotation`` remains as a compatibility alias on ``MixamoBone``.
 """
 
 from __future__ import annotations
@@ -18,7 +20,7 @@ from typing import Any, Iterable
 
 import numpy as np
 
-from .fbx_skeleton import matrix_to_quat_wxyz
+from .fbx_skeleton import matrix_to_quat_wxyz, rotation_part
 
 
 def _as_vec3(value: Iterable[float]) -> np.ndarray:
@@ -185,11 +187,16 @@ class MixamoBone:
     name: str
     parent: str | None
     children: list[str]
-    pre_rotation: np.ndarray
+    rest_rotation: np.ndarray
     lcl_translation_cm: np.ndarray
     rest_world: np.ndarray
     rest_local: np.ndarray
     pre_rotation_euler_deg: np.ndarray
+
+    @property
+    def pre_rotation(self) -> np.ndarray:
+        """Backward-compatible alias; now stores the full bind rotation."""
+        return self.rest_rotation
 
 
 @dataclass
@@ -213,14 +220,20 @@ def rig_from_skeleton_data(data: dict[str, Any], source: Path) -> MixamoRig:
     bones: dict[str, MixamoBone] = {}
     for raw in data["bones"]:
         name = str(raw["name"])
+        rest_local = raw.get("rest_local", {})
+        rest_rotation = rest_local.get("rotation_matrix")
+        if rest_rotation is None:
+            rest_rotation = raw.get("rest_rotation_matrix")
+        if rest_rotation is None:
+            rest_rotation = raw.get("pre_rotation_matrix", np.eye(3).tolist())
         bones[name] = MixamoBone(
             name=name,
             parent=raw["parent"],
             children=list(raw["children"]),
-            pre_rotation=_as_mat3(raw["pre_rotation_matrix"]),
-            lcl_translation_cm=_as_vec3(raw["lcl_translation"]),
+            rest_rotation=rotation_part(_as_mat3(rest_rotation)),
+            lcl_translation_cm=_as_vec3(raw.get("lcl_translation", rest_local.get("translation", [0, 0, 0]))),
             rest_world=_as_mat4(raw["rest_world"]["matrix"]),
-            rest_local=_as_mat4(raw["rest_local"]["matrix"]),
+            rest_local=_as_mat4(rest_local["matrix"]),
             pre_rotation_euler_deg=_as_vec3(raw["pre_rotation_euler_deg"]),
         )
     return MixamoRig(
@@ -240,9 +253,9 @@ def load_mixamo_rig(path: Path) -> MixamoRig:
 
 
 def local_matrix(bone: MixamoBone, r_anim: np.ndarray, translation_cm: np.ndarray | None = None) -> np.ndarray:
-    """Assimp-equivalent local node: T * Rpre * R_anim."""
+    """Local node transform: T_bind * R_bind * rest-relative animation delta."""
     t = bone.lcl_translation_cm if translation_cm is None else np.asarray(translation_cm, dtype=np.float64)
-    return mat4(bone.pre_rotation @ r_anim, t)
+    return mat4(bone.rest_rotation @ r_anim, t)
 
 
 def forward_kinematics(
@@ -284,8 +297,8 @@ def bone_direction_world(rig: MixamoRig, world: dict[str, np.ndarray], parent: s
 
 
 def anim_from_world_rotation(bone: MixamoBone, r_parent_world: np.ndarray, r_world: np.ndarray) -> np.ndarray:
-    """R_anim such that R_parent * Rpre * R_anim = R_world."""
-    return bone.pre_rotation.T @ r_parent_world.T @ r_world
+    """R_anim such that R_parent * R_bind * R_anim = R_world."""
+    return bone.rest_rotation.T @ r_parent_world.T @ r_world
 
 
 def swing_anim_to_direction(
@@ -298,8 +311,8 @@ def swing_anim_to_direction(
 ) -> np.ndarray:
     """Lcl Rotation that aims this bone's rest axis at target_dir_world.
 
-    Rest axis is the child's Lcl Translation (Mixamo local +Y) after PreRotation:
-        R_parent * Rpre * R_anim * d_local = d_target
+    Rest axis is the child's bind-local translation after the full rest rotation:
+        R_parent * R_bind * R_anim * d_local = d_target
     """
     bone = rig.bones[bone_name]
     parent_r = np.eye(3) if bone.parent is None else world[bone.parent][:3, :3]
@@ -307,7 +320,7 @@ def swing_anim_to_direction(
         if child_name is None:
             raise ValueError(f"{bone_name}: need child_name or d_local")
         d_local = rig.child_offset_cm(bone_name, child_name)
-    d_in_anim = bone.pre_rotation.T @ parent_r.T @ normalize(target_dir_world)
+    d_in_anim = bone.rest_rotation.T @ parent_r.T @ normalize(target_dir_world)
     return rotation_aligning(d_local, d_in_anim)
 
 
@@ -335,13 +348,13 @@ def frame_anim_from_two_vectors(
 
     Used for feet: primary = ankle→toe (forward), secondary = world up (twist).
     """
-    r_rest_world = r_parent_world @ bone.pre_rotation
+    r_rest_world = r_parent_world @ bone.rest_rotation
     r_rest_frame = frame_from_primary_secondary(
         r_rest_world @ rest_primary_local, r_rest_world @ rest_secondary_local
     )
     r_tgt_frame = frame_from_primary_secondary(tgt_primary_world, tgt_secondary_world)
     r_world = (r_tgt_frame @ r_rest_frame.T) @ r_rest_world
-    return bone.pre_rotation.T @ r_parent_world.T @ r_world
+    return bone.rest_rotation.T @ r_parent_world.T @ r_world
 
 
 def frame_anim_from_axes(
@@ -357,11 +370,11 @@ def frame_anim_from_axes(
     Used for Hips and Spine2 so clavicle attachments keep a chest twist, not a
     free swing around the spine.
     """
-    r_rest_world = r_parent_world @ bone.pre_rotation
+    r_rest_world = r_parent_world @ bone.rest_rotation
     r_rest_frame = orthonormal_frame(r_rest_world @ rest_left_local, r_rest_world @ rest_up_local)
     r_tgt_frame = orthonormal_frame(tgt_left_world, tgt_up_world)
     r_world = (r_tgt_frame @ r_rest_frame.T) @ r_rest_world
-    return bone.pre_rotation.T @ r_parent_world.T @ r_world
+    return bone.rest_rotation.T @ r_parent_world.T @ r_world
 
 
 

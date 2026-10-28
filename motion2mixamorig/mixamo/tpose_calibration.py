@@ -170,9 +170,10 @@ def canonical_mixamo_tpose(rig: MixamoRig) -> dict[str, np.ndarray]:
 def rig_rest_from_skeleton_data(data: dict, fbx_path: Path) -> tuple[dict[str, np.ndarray], dict]:
     """Core Mixamo bones from the character FBX rest pose.
 
-    PreRotation is already inside the local matrix. Assimp
-    `$AssimpFbx$_PreRotation` helpers are not anatomical bones; extract_skeleton
-    applies Maya/FBX `T * Rpre * R * ...` so those extra nodes are not listed.
+    The full FBX bind transform is already represented in the extracted local
+    and world matrices. Assimp `$AssimpFbx$_PreRotation` helper nodes are not
+    anatomical bones; extract_skeleton resolves bind matrices directly, so
+    those extra nodes are not listed.
     """
     pos: dict[str, np.ndarray] = {}
     for bone in data["bones"]:

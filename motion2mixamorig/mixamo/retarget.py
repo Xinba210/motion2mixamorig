@@ -1,6 +1,6 @@
 """Human → Mixamo per-frame retarget.
 
-FK is T * Rpre * R_anim. Mixamo rest bone lengths are never scaled.
+FK is T_bind * R_bind * R_anim. Mixamo rest bone lengths are never scaled.
 Optional previous-frame rotations pick the 180-degree twist closest to the
 last frame and enforce quaternion sign continuity. No temporal smoothing.
 """
@@ -95,7 +95,7 @@ SWING_TARGETS_NO_CLAVICLE = {
     "mixamorig:RightForeArm": ("right_elbow", "right_wrist"),
 }
 
-# Child that defines this bone's rest axis (local +Y after PreRotation).
+# Child that defines this bone's rest axis (local +Y after the full bind rotation).
 AIM_CHILD = {
     "mixamorig:Spine": "mixamorig:Spine1",
     "mixamorig:Spine1": "mixamorig:Spine2",
@@ -280,13 +280,13 @@ def human_dir(motion, frame: int, start: str, end: str) -> np.ndarray:
 
 
 def verify_rest_fk(rig: MixamoRig, atol: float = 1e-4) -> float:
-    """Identity R_anim must reproduce the FBX rest pose (PreRotation included)."""
+    """Identity R_anim must reproduce the FBX rest pose (the full bind rotation included)."""
     world = forward_kinematics(rig, {})
     err = 0.0
     for name, bone in rig.bones.items():
         err = max(err, float(np.linalg.norm(world[name] - bone.rest_world)))
     if err > atol:
-        raise RuntimeError(f"rest FK mismatch {err:.4g} > {atol} — PreRotation composition is wrong")
+        raise RuntimeError(f"rest FK mismatch {err:.4g} > {atol} — bind-rotation composition is wrong")
     return err
 
 
@@ -371,7 +371,7 @@ def _foot_rotation(rig: MixamoRig, world: dict[str, np.ndarray], motion, frame: 
     bone = rig.bones[foot]
     parent_r = world[bone.parent][:3, :3] if bone.parent else np.eye(3)
     along_local = rig.child_offset_cm(foot, toe)
-    r_rest = parent_r @ bone.pre_rotation
+    r_rest = parent_r @ bone.rest_rotation
     up_local = r_rest.T @ WORLD_UP
     ankle = "left_ankle" if side == "Left" else "right_ankle"
     foot_j = "left_foot" if side == "Left" else "right_foot"

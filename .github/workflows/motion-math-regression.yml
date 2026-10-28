@@ -1,0 +1,32 @@
+name: Motion math regressions (no model weights)
+
+on:
+  push:
+    branches:
+      - research/v0.1.8-windows-validation
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  motion-math:
+    name: Motion math / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: 'pyproject.toml'
+      - name: Install numpy only (no GVHMR, weights, or registered models)
+        run: python -m pip install "numpy==1.26.4"
+      - name: Foot-lock and ground math regression tests
+        run: python -m unittest discover -s tests -p "test_foot_lock_math.py" -v

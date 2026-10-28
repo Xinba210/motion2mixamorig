@@ -1,7 +1,8 @@
-"""Load Mixamo character meshes + skin clusters from binary FBX.
+"""Load Mixamo character meshes, bind matrices, and limbs from binary FBX.
 
-Does not change retargeting. FK is the existing T * Rpre * R_anim chain;
-finger bones stay at rest (identity R_anim) and follow the hands.
+The full local bind rotation is recovered from FBX Pose / Cluster bind data
+when available. Finger bones stay at rest (identity animation delta) and follow
+the hands, regardless of whether the source file uses PreRotation.
 """
 
 from __future__ import annotations
@@ -16,12 +17,14 @@ from .fbx_skeleton import (
     bone_local_matrix,
     build_hierarchy,
     collect_limb_nodes,
-    compose_world,
-    euler_xyz_deg_to_matrix,
+    compose_rest_transforms,
     extract_connections,
+    extract_bind_pose,
+    extract_cluster_bind_transforms,
     extract_global_settings,
     extract_objects,
     parse_fbx,
+    rotation_part,
     unit_to_meters,
 )
 from .kinematics import MixamoBone, MixamoRig, forward_kinematics
@@ -322,6 +325,7 @@ class SkinnedMesh:
     ibm: np.ndarray  # (B, 4, 4) inverse bind = Cluster.Transform
     color: np.ndarray
     face_colors: np.ndarray | None = None  # (F, 3) BGR from the diffuse map
+    bind_mesh_matrix: np.ndarray = field(default_factory=lambda: np.eye(4))
 
 
 @dataclass
@@ -336,7 +340,11 @@ class YBotAsset:
 
 
 def load_full_rig(fbx_path: Path) -> MixamoRig:
-    """Every Mixamo limb, same PreRotation local-matrix convention as the core rig."""
+    """Load every limb, recovering bind orientations even when PreRotation was baked.
+
+    FBX Pose nodes are preferred, then skin Cluster TransformLink matrices, and
+    local TRS is used for end-site or otherwise unskinned bones.
+    """
     fbx_path = Path(fbx_path)
     version, nodes = parse_fbx(fbx_path)
     objects = extract_objects(nodes)
@@ -344,13 +352,15 @@ def load_full_rig(fbx_path: Path) -> MixamoRig:
     settings = extract_global_settings(nodes)
     limbs = collect_limb_nodes(objects)
     parent_of = build_hierarchy(limbs, connections)
-    local_of: dict[int, np.ndarray] = {}
+    local_from_properties: dict[int, np.ndarray] = {}
     parts_of: dict[int, dict[str, np.ndarray]] = {}
     for uid, obj in limbs.items():
         local, parts = bone_local_matrix(obj["props"])
-        local_of[uid] = local
+        local_from_properties[uid] = local
         parts_of[uid] = parts
-    world_of = compose_world(parent_of, local_of)
+    bind_world = extract_cluster_bind_transforms(objects, connections, limbs)
+    bind_world.update(extract_bind_pose(objects))
+    local_of, world_of = compose_rest_transforms(parent_of, local_from_properties, bind_world)
 
     children_of: dict[int, list[int]] = {uid: [] for uid in limbs}
     for uid, parent in parent_of.items():
@@ -380,8 +390,8 @@ def load_full_rig(fbx_path: Path) -> MixamoRig:
             name=name,
             parent=parent_name,
             children=child_names,
-            pre_rotation=euler_xyz_deg_to_matrix(parts["pre_rotation_euler_deg"]),
-            lcl_translation_cm=parts["lcl_translation"].copy(),
+            rest_rotation=rotation_part(local_of[uid][:3, :3]),
+            lcl_translation_cm=local_of[uid][:3, 3].copy(),
             rest_world=world_of[uid],
             rest_local=local_of[uid],
             pre_rotation_euler_deg=parts["pre_rotation_euler_deg"].copy(),
@@ -458,6 +468,7 @@ def load_character_asset(
         n_verts = vertices.shape[0]
         weights = np.zeros((n_verts, n_bones), dtype=np.float64)
         ibm = np.repeat(np.eye(4)[None, ...], n_bones, axis=0)
+        bind_mesh_matrix: np.ndarray | None = None
         for cluster_uid, skin_uid in cluster_to_skin.items():
             if skin_to_geom.get(skin_uid) != geom_uid:
                 continue
@@ -471,9 +482,18 @@ def load_character_asset(
             idx_elem = _child_named(cluster["raw"], "Indexes")
             w_elem = _child_named(cluster["raw"], "Weights")
             t_elem = _child_named(cluster["raw"], "Transform")
+            tl_elem = _child_named(cluster["raw"], "TransformLink")
             b = bone_index[bone_name]
             if t_elem is not None and t_elem["props"]:
                 ibm[b] = _mat4_fbx(t_elem["props"][0])
+                if tl_elem is not None and tl_elem["props"]:
+                    # Cluster.Transform is the inverse-bind relation from the
+                    # linked joint to this mesh's bind transform. The product
+                    # reconstructs the mesh transform that must be baked into
+                    # the skin palette because the GLB mesh node is identity.
+                    candidate = _mat4_fbx(tl_elem["props"][0]) @ ibm[b]
+                    if bind_mesh_matrix is None:
+                        bind_mesh_matrix = candidate
             if idx_elem is None or w_elem is None:
                 continue
             indexes = np.asarray(idx_elem["props"][0], dtype=np.int64)
@@ -491,6 +511,7 @@ def load_character_asset(
                 ibm=ibm,
                 color=colors.get(_fbx_name(geom["name"]), np.array([0.6, 0.6, 0.6])),
                 face_colors=tinted,
+                bind_mesh_matrix=(bind_mesh_matrix if bind_mesh_matrix is not None else np.eye(4)),
             )
         )
     return YBotAsset(rig=rig, meshes=meshes, bone_index=bone_index)
@@ -534,10 +555,22 @@ def posed_vertices(
 
 
 def rest_skin_error(asset: YBotAsset) -> float:
-    """Identity R_anim must reproduce bind vertices (PreRotation FK + IBM)."""
+    """Maximum rest-skin error against vertices transformed into rig space.
+
+    FBX Geometry vertices are mesh-local. The mesh Model transform is encoded
+    in the skin palette (Cluster.Transform / TransformLink), not as a separate
+    GLB mesh-node transform, so comparing posed vertices directly to the raw
+    geometry array would report a false error.
+    """
     world = forward_kinematics(asset.rig, {})
     err = 0.0
     for mesh in asset.meshes:
         posed = skin_mesh(mesh, bone_palette(world, mesh, asset.rig.order))
-        err = max(err, float(np.linalg.norm(posed - mesh.vertices, axis=1).max()))
+        vertices_h = np.concatenate(
+            [mesh.vertices, np.ones((mesh.vertices.shape[0], 1), dtype=np.float64)], axis=1
+        )
+        expected = (vertices_h @ mesh.bind_mesh_matrix.T)[:, :3]
+        weighted = mesh.weights.sum(axis=1) > 1e-8
+        if np.any(weighted):
+            err = max(err, float(np.linalg.norm(posed[weighted] - expected[weighted], axis=1).max()))
     return err
