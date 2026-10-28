@@ -56,3 +56,9 @@ AI agents: Do not mark any unexecuted gate as PASS. Keep all new changes on a se
 - GitHub Actions push and PR runs **SUCCESS** ([run 40637273924](https://github.com/Xinba210/motion2mixamorig/actions/runs/40637273924), [run 40637275990](https://github.com/Xinba210/motion2mixamorig/actions/runs/40637275990)).
 - Latest checked upstream release remains **v0.1.8** and commit **f05a718188026b06e7ee64b47bab077970444b19**.
 - Pending: full runtime dependencies, licensed input assets, inference, retargeting/GLB export, animation quality, and commercial approvals. **Do not treat unit/CI PASS as animation acceptance.**
+
+## Runtime install and doctor — verified 2026-10-28
+- Isolated `uv pip install` for `motion2mixamorig==0.1.8` completed successfully: **exit 0**. The resulting environment includes `gvhmr==1.6.1`, `torch==2.14.1`, OpenCV, `smplx`, and `numpy==2.4.6`. This new NumPy version requires separate legacy `chumpy` compatibility scrutiny; no production inference certification implied.
+- Re-ran `python -m motion2mixamorig.cli doctor` inside the isolated environment. Dependency probes for `numpy`, `cv2`, `torch`, `gvhmr` and `ffmpeg` all **OK**. Exit code remains **1**, solely because this workspace has no registered `SMPLX_NEUTRAL.npz`, Mixamo FBX or single-person source video/still.
+- Re-ran nine motion-math regression tests after full install: **9/9 PASS**, exit code **0**.
+- No licensed model assets, inference weights, original customer video, commercial game deliverable or generated animation GLB were created or downloaded.
