@@ -62,3 +62,10 @@ AI agents: Do not mark any unexecuted gate as PASS. Keep all new changes on a se
 - Re-ran `python -m motion2mixamorig.cli doctor` inside the isolated environment. Dependency probes for `numpy`, `cv2`, `torch`, `gvhmr` and `ffmpeg` all **OK**. Exit code remains **1**, solely because this workspace has no registered `SMPLX_NEUTRAL.npz`, Mixamo FBX or single-person source video/still.
 - Re-ran nine motion-math regression tests after full install: **9/9 PASS**, exit code **0**.
 - No licensed model assets, inference weights, original customer video, commercial game deliverable or generated animation GLB were created or downloaded.
+
+## Late compatibility probe — Python 3.11 / chumpy (2026-10-28)
+- Isolated runtime actual module imports: `numpy 2.4.6`, `torch 2.14.1+cpu`, `cv2 5.0.0`, `gvhmr` **PASS**. `torch.cuda.is_available()` **False** despite RTX 5060 hardware; CUDA inference needs separate verified wheel/runtime work.
+- `uv pip check`: **106 installed packages compatible**, exit 0. This checks package metadata constraints, not legacy import/runtime behavior.
+- Standalone `import chumpy`: **FAIL** under Python 3.11, `AttributeError: module inspect has no attribute getargspec`. This may affect workflows that import Chumpy; it has not yet been established whether the main inference path imports it.
+- An **ephemeral, process-local** compatibility probe using `inspect.getargspec = inspect.getfullargspec` and only missing legacy NumPy aliases passed: `CHUMPY_SHIM_EXIT=0`. This does **not** mean production code is fixed; no changes were made to site-packages or global Python startup. Formal compatibility code should be added only after real inference coverage and impact review.
+- P1 status: runtime packages installed, CLI doctor checks 5 software modules OK; **gated input assets missing; full end-to-end inference not attempted**.
